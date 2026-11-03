@@ -129,6 +129,89 @@ app.post('/api/homes/:homeId/bills', async (c) => {
   return c.json({ id: billId, homeId, title, totalCents, shares }, 201)
 })
 
+type PaidShareRow = {
+  id: string
+  member_id: string
+  amount_cents: number
+  paid_at: string | null
+  idempotency_key: string | null
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('UNIQUE constraint failed')
+}
+
+// Idempotency-Key is unique across all shares (uq_shares_idempotency_key), so a key identifies one
+// payment. Reusing it for a different share is a client error and answers 409 instead of a 500.
+app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
+  const billId = c.req.param('billId')
+  const shareId = c.req.param('shareId')
+
+  const key = c.req.header('Idempotency-Key')?.trim()
+  if (!key) return c.json({ error: 'Idempotency-Key header is required' }, 400)
+
+  // Atomic conditional update: only one concurrent request can flip paid_at from NULL.
+  let paidNow = false
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE shares SET paid_at = ?, idempotency_key = ?
+       WHERE id = ? AND bill_id = ? AND paid_at IS NULL`,
+    )
+      .bind(new Date().toISOString(), key, shareId, billId)
+      .run()
+    paidNow = result.meta.changes === 1
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      return c.json({ error: 'Idempotency-Key was already used for another payment' }, 409)
+    }
+    throw err
+  }
+
+  const share = await c.env.DB.prepare(
+    `SELECT id, member_id, amount_cents, paid_at, idempotency_key
+     FROM shares WHERE id = ? AND bill_id = ?`,
+  )
+    .bind(shareId, billId)
+    .first<PaidShareRow>()
+  if (!share) return c.json({ error: 'Share not found' }, 404)
+
+  // Not updated by this request: a replay with the same key succeeds, any other key conflicts.
+  if (!paidNow && share.idempotency_key !== key) {
+    return c.json({ error: 'Share has already been paid' }, 409)
+  }
+
+  return c.json(
+    {
+      id: share.id,
+      memberId: share.member_id,
+      amountCents: share.amount_cents,
+      paidAt: share.paid_at,
+    },
+    200,
+  )
+})
+
+app.get('/api/homes/:homeId/balances', async (c) => {
+  const homeId = c.req.param('homeId')
+
+  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?').bind(homeId).first()
+  if (!home) return c.json({ error: 'Home not found' }, 404)
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT m.id AS memberId, m.name AS name,
+       COALESCE((
+         SELECT SUM(s.amount_cents) FROM shares s
+         JOIN bills b ON b.id = s.bill_id
+         WHERE s.member_id = m.id AND s.paid_at IS NULL AND b.home_id = m.home_id
+       ), 0) AS outstandingCents
+     FROM members m WHERE m.home_id = ? ORDER BY m.position ASC`,
+  )
+    .bind(homeId)
+    .all<{ memberId: string; name: string; outstandingCents: number }>()
+
+  return c.json({ balances: results })
+})
+
 app.notFound((c) => c.json({ error: 'Not found' }, 404))
 
 app.onError((err, c) => {
