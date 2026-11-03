@@ -54,6 +54,81 @@ app.post('/api/homes/:homeId/members', async (c) => {
   return c.json({ id, homeId, name: parsed.name }, 201)
 })
 
+type ShareResponse = { id: string; memberId: string; amountCents: number; paidAt: null }
+
+const MAX_TITLE_LENGTH = 200
+
+// Splits totalCents across memberIds in order; the first (total % N) members get one extra cent.
+function splitBill(totalCents: number, memberIds: string[]): ShareResponse[] {
+  const baseShare = Math.floor(totalCents / memberIds.length)
+  const remainder = totalCents % memberIds.length
+  return memberIds.map((memberId, i) => ({
+    id: crypto.randomUUID(),
+    memberId,
+    amountCents: baseShare + (i < remainder ? 1 : 0),
+    paidAt: null,
+  }))
+}
+
+app.post('/api/homes/:homeId/bills', async (c) => {
+  const homeId = c.req.param('homeId')
+
+  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?').bind(homeId).first()
+  if (!home) return c.json({ error: 'Home not found' }, 404)
+
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'Request body must be valid JSON' }, 400)
+  }
+  if (typeof body !== 'object' || body === null) {
+    return c.json({ error: 'Request body must be a JSON object' }, 400)
+  }
+
+  const title = 'title' in body && typeof body.title === 'string' ? body.title.trim() : ''
+  if (title.length === 0 || title.length > MAX_TITLE_LENGTH) {
+    return c.json(
+      { error: `title must be a non-empty string of at most ${MAX_TITLE_LENGTH} characters` },
+      422,
+    )
+  }
+
+  const totalCents = 'totalCents' in body ? body.totalCents : undefined
+  if (typeof totalCents !== 'number' || !Number.isSafeInteger(totalCents) || totalCents <= 0) {
+    return c.json({ error: 'totalCents must be a positive integer' }, 422)
+  }
+
+  const { results: members } = await c.env.DB.prepare(
+    'SELECT id FROM members WHERE home_id = ? ORDER BY position ASC',
+  )
+    .bind(homeId)
+    .all<{ id: string }>()
+  if (members.length === 0) {
+    return c.json({ error: 'Home has no members to split the bill between' }, 422)
+  }
+
+  const billId = crypto.randomUUID()
+  const shares = splitBill(
+    totalCents,
+    members.map((member) => member.id),
+  )
+
+  // D1 runs a batch as a single transaction, so the bill and its shares are saved together or not at all.
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      'INSERT INTO bills (id, home_id, title, total_cents) VALUES (?, ?, ?, ?)',
+    ).bind(billId, homeId, title, totalCents),
+    ...shares.map((share) =>
+      c.env.DB.prepare(
+        'INSERT INTO shares (id, bill_id, member_id, amount_cents) VALUES (?, ?, ?, ?)',
+      ).bind(share.id, billId, share.memberId, share.amountCents),
+    ),
+  ])
+
+  return c.json({ id: billId, homeId, title, totalCents, shares }, 201)
+})
+
 app.notFound((c) => c.json({ error: 'Not found' }, 404))
 
 app.onError((err, c) => {
