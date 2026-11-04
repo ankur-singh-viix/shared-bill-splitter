@@ -58,6 +58,14 @@ type ShareResponse = { id: string; memberId: string; amountCents: number; paidAt
 
 const MAX_TITLE_LENGTH = 200
 
+const CURRENCIES = ['INR', 'USD'] as const
+type Currency = (typeof CURRENCIES)[number]
+const DEFAULT_CURRENCY: Currency = 'USD'
+
+function isCurrency(value: unknown): value is Currency {
+  return CURRENCIES.some((currency) => currency === value)
+}
+
 // Splits totalCents across memberIds in order; the first (total % N) members get one extra cent.
 function splitBill(totalCents: number, memberIds: string[]): ShareResponse[] {
   const baseShare = Math.floor(totalCents / memberIds.length)
@@ -99,6 +107,12 @@ app.post('/api/homes/:homeId/bills', async (c) => {
     return c.json({ error: 'totalCents must be a positive integer' }, 422)
   }
 
+  // Omitted currency keeps the pre-currency behaviour (USD); anything else must be supported.
+  const currency = 'currency' in body ? body.currency : DEFAULT_CURRENCY
+  if (!isCurrency(currency)) {
+    return c.json({ error: `currency must be one of ${CURRENCIES.join(', ')}` }, 422)
+  }
+
   const { results: members } = await c.env.DB.prepare(
     'SELECT id FROM members WHERE home_id = ? ORDER BY position ASC',
   )
@@ -117,8 +131,8 @@ app.post('/api/homes/:homeId/bills', async (c) => {
   // D1 runs a batch as a single transaction, so the bill and its shares are saved together or not at all.
   await c.env.DB.batch([
     c.env.DB.prepare(
-      'INSERT INTO bills (id, home_id, title, total_cents) VALUES (?, ?, ?, ?)',
-    ).bind(billId, homeId, title, totalCents),
+      'INSERT INTO bills (id, home_id, title, total_cents, currency) VALUES (?, ?, ?, ?, ?)',
+    ).bind(billId, homeId, title, totalCents, currency),
     ...shares.map((share) =>
       c.env.DB.prepare(
         'INSERT INTO shares (id, bill_id, member_id, amount_cents) VALUES (?, ?, ?, ?)',
@@ -126,7 +140,7 @@ app.post('/api/homes/:homeId/bills', async (c) => {
     ),
   ])
 
-  return c.json({ id: billId, homeId, title, totalCents, shares }, 201)
+  return c.json({ id: billId, homeId, title, totalCents, currency, shares }, 201)
 })
 
 type PaidShareRow = {
@@ -191,6 +205,11 @@ app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
   )
 })
 
+type BalanceRow = { memberId: string; name: string; inr: number; usd: number }
+
+// Unpaid shares per member, summed separately per currency (currencies are never combined).
+// Default shape is the original contract: outstandingCents counts the default currency (USD) only.
+// `?groupBy=currency` returns every currency as { outstandingByCurrency: { INR, USD } }.
 app.get('/api/homes/:homeId/balances', async (c) => {
   const homeId = c.req.param('homeId')
 
@@ -199,17 +218,100 @@ app.get('/api/homes/:homeId/balances', async (c) => {
 
   const { results } = await c.env.DB.prepare(
     `SELECT m.id AS memberId, m.name AS name,
-       COALESCE((
-         SELECT SUM(s.amount_cents) FROM shares s
-         JOIN bills b ON b.id = s.bill_id
-         WHERE s.member_id = m.id AND s.paid_at IS NULL AND b.home_id = m.home_id
-       ), 0) AS outstandingCents
-     FROM members m WHERE m.home_id = ? ORDER BY m.position ASC`,
+       COALESCE(SUM(CASE WHEN b.currency = 'INR' THEN s.amount_cents END), 0) AS inr,
+       COALESCE(SUM(CASE WHEN b.currency = 'USD' THEN s.amount_cents END), 0) AS usd
+     FROM members m
+     LEFT JOIN shares s ON s.member_id = m.id AND s.paid_at IS NULL
+     LEFT JOIN bills b ON b.id = s.bill_id AND b.home_id = m.home_id
+     WHERE m.home_id = ?
+     GROUP BY m.id, m.name, m.position
+     ORDER BY m.position ASC`,
   )
     .bind(homeId)
-    .all<{ memberId: string; name: string; outstandingCents: number }>()
+    .all<BalanceRow>()
 
-  return c.json({ balances: results })
+  if (c.req.query('groupBy') === 'currency') {
+    return c.json({
+      balances: results.map((row) => ({
+        memberId: row.memberId,
+        name: row.name,
+        outstandingByCurrency: { INR: row.inr, USD: row.usd },
+      })),
+    })
+  }
+  return c.json({
+    balances: results.map((row) => ({
+      memberId: row.memberId,
+      name: row.name,
+      outstandingCents: row.usd,
+    })),
+  })
+})
+
+type MemberRow = { id: string; name: string }
+type BillRow = {
+  id: string
+  title: string
+  total_cents: number
+  currency: Currency
+  created_at: string
+}
+type BillShareRow = {
+  id: string
+  bill_id: string
+  member_id: string
+  amount_cents: number
+  paid_at: string | null
+}
+
+// Read-only snapshot of a home for the web app: members, then bills (newest first) with shares.
+app.get('/api/homes/:homeId', async (c) => {
+  const homeId = c.req.param('homeId')
+
+  const home = await c.env.DB.prepare('SELECT id, name FROM homes WHERE id = ?')
+    .bind(homeId)
+    .first<{ id: string; name: string }>()
+  if (!home) return c.json({ error: 'Home not found' }, 404)
+
+  const [members, bills, shares] = await c.env.DB.batch<MemberRow | BillRow | BillShareRow>([
+    c.env.DB.prepare('SELECT id, name FROM members WHERE home_id = ? ORDER BY position ASC').bind(
+      homeId,
+    ),
+    c.env.DB.prepare(
+      `SELECT id, title, total_cents, currency, created_at FROM bills
+       WHERE home_id = ? ORDER BY created_at DESC, rowid DESC`,
+    ).bind(homeId),
+    c.env.DB.prepare(
+      `SELECT s.id, s.bill_id, s.member_id, s.amount_cents, s.paid_at
+       FROM shares s
+       JOIN bills b ON b.id = s.bill_id
+       JOIN members m ON m.id = s.member_id
+       WHERE b.home_id = ? ORDER BY m.position ASC`,
+    ).bind(homeId),
+  ])
+
+  const shareRows = (shares?.results ?? []) as BillShareRow[]
+  return c.json({
+    id: home.id,
+    name: home.name,
+    members: (members?.results ?? []) as MemberRow[],
+    bills: ((bills?.results ?? []) as BillRow[]).map((bill) => ({
+      id: bill.id,
+      homeId,
+      title: bill.title,
+      totalCents: bill.total_cents,
+      currency: bill.currency,
+      createdAt: bill.created_at,
+      shares: shareRows
+        .filter((share) => share.bill_id === bill.id)
+        .map((share) => ({
+          id: share.id,
+          memberId: share.member_id,
+          amountCents: share.amount_cents,
+          paidAt: share.paid_at,
+        })),
+    })),
+  })
 })
 
 app.notFound((c) => c.json({ error: 'Not found' }, 404))

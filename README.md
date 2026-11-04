@@ -60,9 +60,9 @@ All amounts are whole **cents** (integers). `100` cents is 1 dollar. Never use d
 
 #### `POST /api/homes/:homeId/bills`
 
-- Request: `{ "title": string, "totalCents": number }`
-- Success: `201` `{ id, homeId, title, totalCents, shares: [{ id, memberId, amountCents, paidAt: null }] }`
-- Errors: `404` home not found. `422` total is not a positive whole number, or the home has no members.
+- Request: `{ "title": string, "totalCents": number, "currency"?: "INR" | "USD" }` (`currency` defaults to `USD`)
+- Success: `201` `{ id, homeId, title, totalCents, currency, shares: [{ id, memberId, amountCents, paidAt: null }] }`
+- Errors: `404` home not found. `422` total is not a positive whole number, the currency is not supported, or the home has no members.
 
 #### `POST /api/bills/:billId/shares/:shareId/pay`
 
@@ -72,7 +72,8 @@ All amounts are whole **cents** (integers). `100` cents is 1 dollar. Never use d
 
 #### `GET /api/homes/:homeId/balances`
 
-- Success: `200` `{ balances: [{ memberId, name, outstandingCents }] }`
+- Success: `200` `{ balances: [{ memberId, name, outstandingCents }] }` (unpaid `USD` shares only, see Decisions)
+- With `?groupBy=currency`: `200` `{ balances: [{ memberId, name, outstandingByCurrency: { INR, USD } }] }`
 - Errors: `404` home not found
 
 **Rules**
@@ -155,3 +156,63 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+---
+
+## Project overview
+
+Shared Bill Splitter lets a household create a home, add members, split bills equally between them, and track who has paid. Each bill is in **INR** or **USD**, and the two currencies are never converted or added together.
+
+### Architecture
+
+| Part     | Location           | Notes                                                                                                        |
+| -------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| API      | `api/src/index.ts` | Hono on Cloudflare Workers. Plain parameterized SQL on the `DB` D1 binding.                                  |
+| Database | `api/migrations/`  | `0001_init.sql` (homes, members, bills, shares) and `0002_bill_currency.sql` (bill currency).                |
+| Web      | `web/src/`         | React, Vite and TanStack Router. `api.ts` is the only file that calls `fetch`.                               |
+| Tests    | `api/test/`        | Vitest in the Workers runtime. `currency.test.ts` covers currencies; the other files are the supplied tests. |
+
+### Features
+
+- Home and member management. Members keep their insertion order (`position`).
+- Equal split in integer minor units (cents / paise). The extra units go to the earliest-added members.
+- Per-bill currency (INR or USD), saved in the database. `₹1,25,000.00` and `$1,250.00` formatting through `Intl.NumberFormat`.
+- Idempotent payments (`Idempotency-Key`) with an atomic conditional `UPDATE`.
+- Dashboard with overview cards, members, bills, balances and settings sections.
+- Dark (default) and light themes. The choice is saved in `localStorage` and applied before first paint (`web/public/theme-init.js`).
+- Loading, empty, error, timeout and payment-failure states. A failed refresh keeps the last loaded data.
+
+### Additional endpoint
+
+`GET /api/homes/:homeId` returns `{ id, name, members, bills: [{ id, homeId, title, totalCents, currency, createdAt, shares }] }` for the web app.
+
+### Currency
+
+- `bills.currency` is `'INR'` or `'USD'`, protected by the named constraint `ck_bills_currency_supported`. Shares take the currency of their bill.
+- Existing rows get `USD` from the column default, so data created before `0002` keeps its meaning.
+- The header currency control only chooses the default for **new** bills. It never changes existing bills.
+- Overview totals (billed, paid, outstanding) and member balances are always shown per currency.
+
+### Run and test
+
+```bash
+pnpm install
+pnpm dev          # applies migrations to the local D1 database, then api :8787 and web :5173
+pnpm test         # Vitest
+pnpm check        # Biome
+pnpm typecheck
+pnpm build
+```
+
+## Decisions
+
+1. **Integer minor units everywhere.** Money is stored and calculated as whole cents or paise, and only formatted at the edge. This avoids floating-point rounding, and it makes "the shares add up to the total" an exact property.
+2. **Payment safety lives in one SQL statement.** `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL` is atomic, so two simultaneous requests cannot both succeed. The affected-row count decides the answer: one row changed means paid now, zero rows means replay (same key, `200`) or conflict (other key, `409`). A unique index on the key makes the key global, and reuse on another share answers `409` instead of `500`.
+3. **Bill and shares are written in one `DB.batch`.** D1 runs a batch as a single transaction, so a bill can never exist without its shares.
+4. **Currencies are kept separate, with no conversion.** There is no exchange rate source and a combined total would be misleading. Balances are returned per currency.
+5. **The balances endpoint keeps its original shape by default.** The supplied tests compare `{ memberId, name, outstandingCents }` exactly, so adding `outstandingByCurrency` to that response would break them. The default response therefore reports the default currency (USD) in `outstandingCents`, and the per-currency breakdown is `GET /api/homes/:homeId/balances?groupBy=currency`, which the web app uses.
+6. **Section navigation is component state, not routes.** The app is one page. Only the selected home is in the URL (`?homeId=`), so a link reopens the same home.
+
+## AI tools disclosure
+
+Claude (Claude Code) and ChatGPT were used while building this project. Claude Code helped write and refactor the API routes, the SQL migrations, the tests and the React frontend, and ran the checks. ChatGPT was used for planning and for drafting the task prompts. The author reviewed the code and is responsible for it.

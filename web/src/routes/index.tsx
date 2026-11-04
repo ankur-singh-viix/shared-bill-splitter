@@ -1,16 +1,20 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { HomePicker } from '../components/HomePicker'
+import { HomeView } from '../components/HomeView'
 
 export const Route = createFileRoute('/')({
+  validateSearch: (search: Record<string, unknown>): { homeId?: string } =>
+    typeof search.homeId === 'string' && search.homeId !== '' ? { homeId: search.homeId } : {},
   component: Home,
 })
 
 function Home() {
-  return (
-    <main style={{ padding: 24, fontFamily: 'system-ui, sans-serif' }}>
-      <h1>Bill Splitter — starter</h1>
-      <p>
-        Replace this with the app. See <code>README.md</code> at the repo root.
-      </p>
-    </main>
+  const { homeId } = Route.useSearch()
+  const navigate = useNavigate({ from: Route.fullPath })
+
+  return homeId ? (
+    <HomeView key={homeId} homeId={homeId} onLeave={() => void navigate({ search: {} })} />
+  ) : (
+    <HomePicker onSelect={(id) => void navigate({ search: { homeId: id } })} />
   )
 }
