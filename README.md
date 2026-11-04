@@ -109,6 +109,13 @@ You must handle these cases and talk about them in your video:
 
 ## Run it
 
+Prerequisites: Node.js 24.22.1 and pnpm.
+
+```bash
+git clone https://github.com/ankur-singh-viix/shared-bill-splitter
+cd shared-bill-splitter
+```
+
 This is a pnpm workspace. Install once at the root.
 
 ```bash
@@ -116,7 +123,7 @@ pnpm install
 pnpm dev          # api on :8787 and web on :5173
 ```
 
-Open http://localhost:5173. The starter page shows a title. `/api/health` returns `{ "status": "ok" }`.
+Open http://localhost:5173 to use the app. `/api/health` returns `{ "status": "ok" }`.
 
 ```bash
 pnpm test         # run the visible tests in api/test
@@ -138,7 +145,7 @@ pnpm --filter bill-splitter-api cf-typegen
 
 ## Rules for the tests
 
-- The visible tests are in `api/test`. They start with a failing result. Your job is to make them pass.
+- The visible tests are in `api/test`. They all pass with the current implementation.
 - Do **not** change the visible tests or `api/test/helpers.ts`. We compare them with the original.
 - We run extra tests after you submit. They test the cases in "Cases you must handle" more closely.
 
@@ -215,4 +222,16 @@ pnpm build
 
 ## AI tools disclosure
 
-Claude (Claude Code) and ChatGPT were used while building this project. Claude Code helped write and refactor the API routes, the SQL migrations, the tests and the React frontend, and ran the checks. ChatGPT was used for planning and for drafting the task prompts. The author reviewed the code and is responsible for it.
+I used Claude Pro in VS Code Agent mode and ChatGPT during the development of this project.
+
+Claude was primarily used to assist with implementation, including the backend APIs, database schema, React frontend, bill-splitting logic, payment handling, currency support, and automated tests.
+
+I used ChatGPT for understanding requirements, planning the architecture, preparing implementation prompts, reviewing code changes, identifying edge cases, and debugging.
+
+My contribution was defining the requirements, guiding the implementation step by step, reviewing the generated changes, making technical decisions, and validating the application through manual testing and automated checks.
+
+I paid particular attention to important edge cases, including uneven bill splitting, invalid amounts, duplicate payment requests, concurrent payment attempts, missing bills or shares, and independent INR/USD handling.
+
+I also ran the test suite, type checks, code quality checks, and production build to verify the implementation.
+
+I understand the architecture, API flow, database relationships, business logic, and technical trade-offs used in the project, and I am prepared to explain them during the code walkthrough or a live discussion.
